@@ -187,6 +187,9 @@ export type {
 	TurnStartEvent,
 	UIPromptEndEvent,
 	UIPromptKind,
+	UIPromptRequestDetails,
+	UIPromptRequestEvent,
+	UIPromptRequestResult,
 	UIPromptStartEvent,
 	// Events - User Bash
 	UserBashEvent,

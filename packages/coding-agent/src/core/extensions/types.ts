@@ -841,6 +841,24 @@ export interface AgentSettledEvent {
 
 export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
 
+/** Supported remote dialog data; custom TUI components remain local-only. */
+export type UIPromptRequestDetails =
+	| { kind: "select"; title: string; options: string[] }
+	| { kind: "confirm"; title: string; message: string }
+	| { kind: "input"; title: string; placeholder?: string }
+	| { kind: "editor"; title: string; prefill?: string };
+
+/** A TUI extension dialog offered to a remote responder before opening the local dialog. */
+export type UIPromptRequestEvent = {
+	type: "ui_prompt_request";
+	requestId: string;
+	sessionId: string;
+	signal: AbortSignal;
+} & UIPromptRequestDetails;
+
+/** Pass opens the normal local UI; handled settles the exact offered dialog. */
+export type UIPromptRequestResult = { action: "pass" } | { action: "handled"; value: string | boolean | undefined };
+
 /** Fired when Pi starts waiting on a blocking user-facing extension UI prompt. */
 export interface UIPromptStartEvent {
 	type: "ui_prompt_start";
@@ -1200,6 +1218,7 @@ export type ExtensionEvent =
 	| AgentSettledEvent
 	| UIPromptStartEvent
 	| UIPromptEndEvent
+	| UIPromptRequestEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -1420,6 +1439,7 @@ export interface ExtensionAPI {
 	on(event: "agent_settled", handler: ExtensionHandler<AgentSettledEvent>): () => void;
 	on(event: "ui_prompt_start", handler: ExtensionHandler<UIPromptStartEvent>): () => void;
 	on(event: "ui_prompt_end", handler: ExtensionHandler<UIPromptEndEvent>): () => void;
+	on(event: "ui_prompt_request", handler: ExtensionHandler<UIPromptRequestEvent, UIPromptRequestResult>): () => void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): () => void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent, TurnEndEventResult>): () => void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): () => void;

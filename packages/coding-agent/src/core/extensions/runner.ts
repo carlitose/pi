@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
@@ -83,6 +84,9 @@ import type {
 	ToolResultEventResult,
 	TurnEndEvent,
 	UIPromptKind,
+	UIPromptRequestDetails,
+	UIPromptRequestEvent,
+	UIPromptRequestResult,
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.ts";
@@ -383,6 +387,7 @@ export class ExtensionRunner {
 	private staleMessage: string | undefined;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
+	private activeRemotePrompts = new Set<AbortController>();
 
 	constructor(
 		extensions: Extension[],
@@ -527,41 +532,151 @@ export class ExtensionRunner {
 	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
 		return {
 			...ui,
-			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
-			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
+			select: (title, options, opts) =>
+				this.withUIPrompt(
+					"select",
+					title,
+					(remaining) =>
+						ui.select(title, options, remaining === undefined ? opts : { ...opts, timeout: remaining }),
+					{ kind: "select", title, options: [...options] },
+					opts?.signal,
+					opts?.timeout,
+				),
+			confirm: (title, message, opts) =>
+				this.withUIPrompt(
+					"confirm",
+					title,
+					(remaining) =>
+						ui.confirm(title, message, remaining === undefined ? opts : { ...opts, timeout: remaining }),
+					{ kind: "confirm", title, message },
+					opts?.signal,
+					opts?.timeout,
+				),
 			input: (title, placeholder, opts) =>
-				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
-			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
+				this.withUIPrompt(
+					"input",
+					title,
+					(remaining) =>
+						ui.input(title, placeholder, remaining === undefined ? opts : { ...opts, timeout: remaining }),
+					{ kind: "input", title, placeholder },
+					opts?.signal,
+					opts?.timeout,
+				),
+			editor: (title, prefill) =>
+				this.withUIPrompt("editor", title, () => ui.editor(title, prefill), { kind: "editor", title, prefill }),
 			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
 		};
 	}
 
-	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {
+	private async offerRemotePrompt(
+		request: UIPromptRequestDetails,
+		callerSignal?: AbortSignal,
+		timeout?: number,
+	): Promise<{ action: "pass" | "cancel" } | { action: "handled"; value: string | boolean | undefined }> {
+		const controller = new AbortController();
+		const sessionId = this.sessionManager.getSessionId();
+		const onCallerAbort = () => controller.abort("caller");
+		callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+		if (callerSignal?.aborted) onCallerAbort();
+		this.activeRemotePrompts.add(controller);
+		const limit = Math.min(Math.max(1, timeout ?? 300_000), 300_000);
+		const timer = setTimeout(() => controller.abort("timeout"), limit);
+		timer.unref?.();
+		const aborted = new Promise<{ action: "aborted" }>((resolve) => {
+			if (controller.signal.aborted) resolve({ action: "aborted" });
+			else controller.signal.addEventListener("abort", () => resolve({ action: "aborted" }), { once: true });
+		});
+		const event: UIPromptRequestEvent = {
+			type: "ui_prompt_request",
+			requestId: randomUUID(),
+			sessionId,
+			signal: controller.signal,
+			...request,
+		};
+		const valid = (value: unknown): value is string | boolean | undefined => {
+			if (request.kind === "confirm") return typeof value === "boolean";
+			if (value === undefined) return true;
+			return typeof value === "string" && (request.kind !== "select" || request.options.includes(value));
+		};
+		try {
+			for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "ui_prompt_request")) {
+				for (const handler of handlers) {
+					const outcome = await Promise.race([
+						Promise.resolve()
+							.then(() => handler(event, this.createContext()))
+							.then(
+								(value) => ({ action: "result" as const, value }),
+								(error: unknown) => ({ action: "error" as const, error }),
+							),
+						aborted,
+					]);
+					if (outcome.action === "aborted" || controller.signal.aborted) {
+						return { action: controller.signal.reason === "timeout" ? "pass" : "cancel" };
+					}
+					if (this.staleMessage || this.sessionManager.getSessionId() !== sessionId) return { action: "cancel" };
+					if (outcome.action === "error") {
+						this.emitError({
+							extensionPath: ext.path,
+							event: "ui_prompt_request",
+							error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+						});
+						continue;
+					}
+					const result = outcome.value as UIPromptRequestResult | undefined;
+					if (result?.action === "handled") {
+						if (valid(result.value)) return { action: "handled", value: result.value };
+						this.emitError({
+							extensionPath: ext.path,
+							event: "ui_prompt_request",
+							error: "Invalid remote dialog response",
+						});
+					}
+				}
+			}
+			return { action: "pass" };
+		} finally {
+			clearTimeout(timer);
+			callerSignal?.removeEventListener("abort", onCallerAbort);
+			this.activeRemotePrompts.delete(controller);
+			controller.abort("settled");
+		}
+	}
+
+	private async withUIPrompt<T>(
+		kind: UIPromptKind,
+		title: string | undefined,
+		run: (remainingTimeout?: number) => Promise<T>,
+		request?: UIPromptRequestDetails,
+		callerSignal?: AbortSignal,
+		timeout?: number,
+	): Promise<T> {
 		const outerPrompt = this.uiPromptDepth++ === 0;
 		if (outerPrompt) {
 			this.activeUIPrompt = { kind, title };
 			this.emitUIPromptEvent({ type: "ui_prompt_start", reason: "ui_prompt", kind, ...(title ? { title } : {}) });
 		}
-
-		const finish = () => {
-			if (--this.uiPromptDepth > 0) return;
-			this.uiPromptDepth = 0;
-
-			const prompt = this.activeUIPrompt ?? { kind, title };
-			this.activeUIPrompt = undefined;
-			this.emitUIPromptEvent({
-				type: "ui_prompt_end",
-				reason: "ui_prompt",
-				kind: prompt.kind,
-				...(prompt.title ? { title: prompt.title } : {}),
-			});
-		};
-
 		try {
-			return run().finally(finish);
-		} catch (err) {
-			finish();
-			throw err;
+			if (request && this.mode === "tui" && this.hasHandlers("ui_prompt_request")) {
+				const startedAt = Date.now();
+				const remote = await this.offerRemotePrompt(request, callerSignal, timeout);
+				if (remote.action === "cancel") return (kind === "confirm" ? false : undefined) as T;
+				const remaining = timeout === undefined ? undefined : timeout - (Date.now() - startedAt);
+				if (remaining !== undefined && remaining <= 0) return (kind === "confirm" ? false : undefined) as T;
+				if (remote.action === "handled") return remote.value as T;
+				return await run(remaining);
+			}
+			return await run();
+		} finally {
+			if (--this.uiPromptDepth === 0) {
+				const prompt = this.activeUIPrompt ?? { kind, title };
+				this.activeUIPrompt = undefined;
+				this.emitUIPromptEvent({
+					type: "ui_prompt_end",
+					reason: "ui_prompt",
+					kind: prompt.kind,
+					...(prompt.title ? { title: prompt.title } : {}),
+				});
+			}
 		}
 	}
 
@@ -681,6 +796,7 @@ export class ExtensionRunner {
 	): void {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
+			for (const controller of this.activeRemotePrompts) controller.abort("invalidated");
 			this.runtime.invalidate(message);
 		}
 	}
